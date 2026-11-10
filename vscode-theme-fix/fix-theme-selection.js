@@ -239,10 +239,15 @@ const OPTS = {
     force: flag('--force'),
     keepPalette: flag('--keep-palette'),
     listThemes: flag('--list-themes'),
+    listProfiles: flag('--list-profiles'),
     help: flag('--help') || flag('-h'),
     userDir: option('--user-dir'),
     extDir: option('--ext-dir'),
     themeName: option('--theme-name'),
+    profile: option('--profile'),
+    workspace: option('--workspace'),
+    noPrompt: flag('--no-prompt') || flag('--yes') || flag('-y'),
+    interactive: flag('--interactive'),
     minContrast: numberOption('--min-contrast', 1.35)
 };
 
@@ -432,33 +437,356 @@ function defaultExtDirs() {
     return dirs.filter(isDir);
 }
 
-/** Carpetas User candidatas: la raíz y cada perfil de VS Code. */
-function listUserDirCandidates() {
+/* -------------------------------------------------------------------------- */
+/* Perfiles de VS Code                                                         */
+/* -------------------------------------------------------------------------- */
+
+/** Ruta normalizada para comparar (sin barra final, minúsculas en Windows). */
+function normalizePath(p) {
+    let s = path.resolve(p).replace(/[\\/]+$/, '');
+    if (process.platform === 'win32') s = s.toLowerCase();
+    return s;
+}
+
+/** Convierte "file:///c%3A/Users/x" en "c:/Users/x". */
+function decodeFileUri(uri) {
+    if (!/^file:\/\//i.test(uri)) return null;
+    let s = uri.replace(/^file:\/\//i, '');
+    try {
+        s = decodeURIComponent(s);
+    } catch (e) {
+        return null;
+    }
+    if (/^\/[A-Za-z]:/.test(s)) s = s.slice(1);
+    return s;
+}
+
+/** Lee globalStorage/storage.json (contiene userDataProfiles y asociaciones). */
+function readStorage(userRoot) {
+    const f = path.join(userRoot, 'globalStorage', 'storage.json');
+    if (!exists(f)) return null;
+    try {
+        return parseJsonc(fs.readFileSync(f, 'utf8'));
+    } catch (e) {
+        return null;
+    }
+}
+
+/** Tema definido en un settings.json concreto, o null. */
+function readThemeOf(settingsFile) {
+    if (!exists(settingsFile)) return null;
+    try {
+        const d = parseJsonc(fs.readFileSync(settingsFile, 'utf8'));
+        return d && d['workbench.colorTheme'] ? d['workbench.colorTheme'] : null;
+    } catch (e) {
+        return null;
+    }
+}
+
+/**
+ * Lista los perfiles de una instalación: los registrados en storage.json más
+ * las carpetas de profiles/ que quedaron huérfanas (sin registrar).
+ * Devuelve [{ name, location, dir, orphan }].
+ */
+function listProfiles(userRoot) {
     const out = [];
+    const seen = {};
+    const storage = readStorage(userRoot);
+    const registered = (storage && storage.userDataProfiles) || [];
 
-    defaultUserDirs().forEach(function (d) {
-        if (!isDir(d)) return;
-        out.push(d);
+    registered.forEach(function (p) {
+        if (!p || !p.location) return;
 
-        const profilesDir = path.join(d, 'profiles');
-        if (!isDir(profilesDir)) return;
+        if (p.location === '__default__profile__') {
+            out.push({
+                name: p.name || 'Default',
+                location: p.location,
+                dir: userRoot,
+                orphan: false
+            });
+            seen[normalizePath(userRoot)] = true;
+            return;
+        }
 
+        const dir = path.join(userRoot, 'profiles', p.location);
+        if (!isDir(dir)) return;
+        out.push({ name: p.name || p.location, location: p.location, dir: dir, orphan: false });
+        seen[normalizePath(dir)] = true;
+    });
+
+    // carpetas de perfil que ya no están registradas en storage.json
+    const profilesDir = path.join(userRoot, 'profiles');
+    if (isDir(profilesDir)) {
         let entries = [];
         try {
             entries = fs.readdirSync(profilesDir);
         } catch (e) {
-            return;
+            entries = [];
         }
-        entries.forEach(function (p) {
-            const pd = path.join(profilesDir, p);
-            if (isDir(pd)) out.push(pd);
+
+        entries.forEach(function (e) {
+            if (e === 'builtin') return; // no es un perfil de usuario
+            const dir = path.join(profilesDir, e);
+            if (!isDir(dir)) return;
+            if (seen[normalizePath(dir)]) return;
+            out.push({ name: e + ' (no registrado)', location: e, dir: dir, orphan: true });
+            seen[normalizePath(dir)] = true;
         });
-    });
+    }
 
     return out;
 }
 
-function resolveUserDir() {
+/**
+ * Devuelve la location del perfil asociado a un workspace, o null si no hay.
+ * Usa profileAssociations.workspaces de storage.json y aplica la coincidencia
+ * más específica (ruta más larga).
+ */
+function findProfileForWorkspace(userRoot, workspacePath) {
+    const storage = readStorage(userRoot);
+    const ws = storage && storage.profileAssociations && storage.profileAssociations.workspaces;
+    if (!ws) return null;
+
+    const target = normalizePath(workspacePath);
+    let best = null;
+    let bestLen = -1;
+
+    Object.keys(ws).forEach(function (key) {
+        const raw = decodeFileUri(key);
+        if (!raw) return;
+
+        let base = normalizePath(raw);
+        // un .code-workspace es un archivo: se compara su carpeta
+        if (/\.code-workspace$/i.test(base)) base = normalizePath(path.dirname(base));
+
+        const hit =
+            target === base ||
+            target.indexOf(base + path.sep) === 0 ||
+            target.indexOf(base + '/') === 0;
+
+        if (hit && base.length > bestLen) {
+            best = ws[key];
+            bestLen = base.length;
+        }
+    });
+
+    return best;
+}
+
+/** Busca la carpeta de un perfil por nombre, location o nombre de carpeta. */
+function findProfileDir(userRoot, wanted) {
+    const w = String(wanted).toLowerCase().trim();
+
+    // el perfil por defecto vive en la raíz de User
+    if (w === 'default' || w === '__default__profile__' || w === 'default profile') {
+        return userRoot;
+    }
+
+    const all = listProfiles(userRoot);
+
+    for (let i = 0; i < all.length; i++) {
+        const p = all[i];
+        const cleanName = String(p.name).toLowerCase().replace(/\s*\(no registrado\)$/, '');
+        if (
+            String(p.location).toLowerCase() === w ||
+            String(p.name).toLowerCase() === w ||
+            cleanName === w
+        ) {
+            return p.dir;
+        }
+    }
+
+    for (let i = 0; i < all.length; i++) {
+        if (String(all[i].name).toLowerCase().indexOf(w) !== -1) return all[i].dir;
+    }
+
+    const literal = path.join(userRoot, 'profiles', wanted);
+    if (isDir(literal)) return literal;
+    return null;
+}
+
+/** Nombre legible del perfil al que corresponde una carpeta User. */
+function describeUserDir(userDir) {
+    const roots = defaultUserDirs().filter(isDir);
+    const target = normalizePath(userDir);
+
+    for (let i = 0; i < roots.length; i++) {
+        const r = roots[i];
+        if (target === normalizePath(r)) return 'Default';
+
+        const profilesRoot = normalizePath(path.join(r, 'profiles'));
+        if (target.indexOf(profilesRoot + path.sep) !== 0) continue;
+
+        const loc = path.basename(userDir);
+        const all = listProfiles(r);
+        for (let j = 0; j < all.length; j++) {
+            if (normalizePath(all[j].dir) === target) return '"' + all[j].name + '" (' + loc + ')';
+        }
+        return loc;
+    }
+
+    return path.basename(userDir);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Entrada interactiva                                                         */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Pregunta por stdin y devuelve la respuesta.
+ * Funciona tanto en terminal (TTY) como con entrada redirigida (pipe).
+ */
+function askLine(question) {
+    return new Promise(function (resolve) {
+        const readline = require('readline');
+        const rl = readline.createInterface({
+            input: process.stdin,
+            output: process.stdout
+        });
+
+        let answered = false;
+
+        rl.question(question, function (answer) {
+            answered = true;
+            rl.close();
+            resolve(String(answer == null ? '' : answer));
+        });
+
+        // stdin cerrado sin respuesta (por ejemplo, entrada vacía)
+        rl.on('close', function () {
+            if (!answered) resolve('');
+        });
+    });
+}
+
+/**
+ * Construye la lista de perfiles candidatos de todas las instalaciones.
+ * Devuelve [{ name, location, dir, orphan, theme, isDefault }].
+ * Si `preferredDir` viene informado, ese perfil se coloca primero (es el
+ * asociado al workspace actual y por tanto la opción por defecto).
+ */
+function buildProfileCandidates(roots, preferredDir) {
+    const list = [];
+    const seen = {};
+
+    function push(item) {
+        const key = normalizePath(item.dir);
+        if (seen[key]) return;
+        seen[key] = true;
+        list.push(item);
+    }
+
+    roots.forEach(function (r) {
+        push({
+            name: 'Default',
+            location: '__default__profile__',
+            dir: r,
+            orphan: false,
+            theme: readThemeOf(path.join(r, 'settings.json')),
+            isDefault: true
+        });
+    });
+
+    roots.forEach(function (r) {
+        listProfiles(r).forEach(function (p) {
+            push({
+                name: p.name,
+                location: p.location,
+                dir: p.dir,
+                orphan: p.orphan,
+                theme: readThemeOf(path.join(p.dir, 'settings.json')),
+                isDefault: false
+            });
+        });
+    });
+
+    // el perfil del workspace actual pasa al primer lugar (opción por defecto)
+    if (preferredDir) {
+        const target = normalizePath(preferredDir);
+        for (let i = 0; i < list.length; i++) {
+            if (normalizePath(list[i].dir) !== target) continue;
+            if (i > 0) list.unshift(list.splice(i, 1)[0]);
+            break;
+        }
+    }
+
+    return list;
+}
+
+/**
+ * Muestra los perfiles numerados y pide al usuario que elija uno.
+ * Enter sin número selecciona el primero.
+ * Devuelve el candidato elegido.
+ */
+async function promptProfileChoice(candidates, preferredDir) {
+    const target = preferredDir ? normalizePath(preferredDir) : null;
+
+    log('');
+    log(C.bold + '  ¿En qué perfil deseas aplicar el fix?' + C.reset);
+    log('');
+
+    candidates.forEach(function (c, i) {
+        const num = String(i + 1).padStart(2, ' ');
+        const tags = [];
+
+        if (c.isDefault) tags.push('settings.json raíz');
+        if (c.orphan) tags.push('no registrado');
+        if (target && normalizePath(c.dir) === target) tags.push('workspace actual');
+
+        const theme = c.theme
+            ? C.bold + c.theme + C.reset
+            : C.dim + '(sin tema definido)' + C.reset;
+
+        log(
+            '   ' +
+                C.cyan +
+                num +
+                C.reset +
+                ') ' +
+                (c.orphan ? C.yellow : '') +
+                c.name +
+                C.reset +
+                '  ' +
+                C.dim +
+                '(' +
+                c.location +
+                ')' +
+                C.reset +
+                (tags.length > 0 ? '  ' + C.dim + '[' + tags.join(', ') + ']' + C.reset : '')
+        );
+        log('       tema: ' + theme);
+    });
+
+    log('');
+
+    const answer = (
+        await askLine('  Número [1-' + candidates.length + '] (Enter = 1): ')
+    ).trim();
+
+    if (!answer) {
+        ok('Usando 1) ' + candidates[0].name);
+        return candidates[0];
+    }
+
+    const n = parseInt(answer, 10);
+    if (isNaN(n) || n < 1 || n > candidates.length) {
+        warn('Opción no válida: "' + answer + '". Se usará la 1.');
+        return candidates[0];
+    }
+
+    ok('Usando ' + n + ') ' + candidates[n - 1].name);
+    return candidates[n - 1];
+}
+
+/**
+ * Resuelve la carpeta User donde vive el tema activo. Prioridad:
+ *   1. --user-dir
+ *   2. --profile <nombre|location>
+ *   3. selección interactiva (si hay terminal y más de un perfil)
+ *   4. perfil asociado al workspace actual (o --workspace)
+ *   5. perfil por defecto (con aviso)
+ */
+async function resolveUserDir() {
     if (OPTS.userDir) {
         if (!isDir(OPTS.userDir)) {
             fail('--user-dir no existe: ' + OPTS.userDir);
@@ -467,27 +795,69 @@ function resolveUserDir() {
         return OPTS.userDir;
     }
 
-    const candidates = listUserDirCandidates();
-    let fallback = null;
-
-    for (let i = 0; i < candidates.length; i++) {
-        const file = path.join(candidates[i], 'settings.json');
-        if (!exists(file)) continue;
-        if (!fallback) fallback = candidates[i];
-
-        let data = null;
-        try {
-            data = parseJsonc(fs.readFileSync(file, 'utf8'));
-        } catch (e) {
-            continue;
-        }
-        if (data && data['workbench.colorTheme']) return candidates[i];
+    const roots = defaultUserDirs().filter(isDir);
+    if (roots.length === 0) {
+        fail('No se encontró la carpeta User de VS Code. Usa --user-dir <ruta>.');
+        process.exit(2);
     }
 
-    if (fallback) return fallback;
+    // 1) perfil indicado explícitamente
+    if (OPTS.profile) {
+        for (let i = 0; i < roots.length; i++) {
+            const dir = findProfileDir(roots[i], OPTS.profile);
+            if (dir) return dir;
+        }
 
-    fail('No se encontró la carpeta User de VS Code. Usa --user-dir <ruta>.');
-    process.exit(2);
+        fail('No se encontró el perfil "' + OPTS.profile + '".');
+        fail('Perfiles disponibles:');
+        printProfiles(roots);
+        process.exit(2);
+    }
+
+    const wsPath = OPTS.workspace || process.cwd();
+
+    // 2) perfil asociado al workspace (se usa como opción por defecto)
+    let assocDir = null;
+    for (let i = 0; i < roots.length; i++) {
+        const loc = findProfileForWorkspace(roots[i], wsPath);
+        if (!loc) continue;
+
+        if (loc === '__default__profile__') {
+            assocDir = roots[i];
+            break;
+        }
+
+        const dir = path.join(roots[i], 'profiles', loc);
+        if (isDir(dir)) {
+            assocDir = dir;
+            break;
+        }
+    }
+
+    // 3) preguntar al usuario en qué perfil aplicar el fix
+    const canPrompt =
+        !OPTS.noPrompt &&
+        !OPTS.check &&
+        (OPTS.interactive || process.stdin.isTTY === true);
+
+    if (canPrompt) {
+        const candidates = buildProfileCandidates(roots, assocDir);
+
+        if (candidates.length > 1) {
+            const chosen = await promptProfileChoice(candidates, assocDir);
+            return chosen.dir;
+        }
+
+        if (candidates.length === 1) return candidates[0].dir;
+    }
+
+    // 4) sin interacción: usar el asociado al workspace
+    if (assocDir) return assocDir;
+
+    // 5) último recurso
+    warn('No hay perfil asociado al workspace: ' + wsPath);
+    warn('Se usará el perfil por defecto. Usa --profile "<nombre>" o --workspace <ruta>.');
+    return roots[0];
 }
 
 function resolveExtDirs() {
@@ -1055,11 +1425,74 @@ function printHelp() {
     log('  --min-contrast <n>    Contraste objetivo de la selección (def. 1.35)');
     log('  --with-settings       Además escribe workbench.colorCustomizations');
     log('  --list-themes         Lista los temas detectados y su contraste');
+    log('  --list-profiles       Lista los perfiles de VS Code y su tema');
     log('  --restore             Restaura los JSON de tema desde .bak');
     log('  --restore-settings    Restaura settings.json desde .bak');
+    log('  --profile <nombre>    Perfil de VS Code a usar (nombre o location)');
+    log('  --workspace <ruta>    Workspace para resolver el perfil activo');
+    log('  --no-prompt, -y       No preguntar; usar el perfil del workspace');
+    log('  --interactive         Forzar la pregunta aunque no haya TTY');
     log('  --user-dir <ruta>     Carpeta User de VS Code');
     log('  --ext-dir <ruta>      Carpeta de extensiones');
     log('  --theme-name <label>  Forzar el label del tema');
+}
+
+/**
+ * Imprime los perfiles de las instalaciones indicadas.
+ * Respeta --user-dir: si se indicó, solo se lista esa carpeta User.
+ */
+function printProfiles(roots) {
+    if (roots.length === 0) {
+        warn('No se encontró la carpeta User de VS Code.');
+        return;
+    }
+
+    roots.forEach(function (r) {
+        log('  ' + C.dim + r + C.reset);
+
+        const rootTheme = readThemeOf(path.join(r, 'settings.json'));
+        log(
+            '    ' +
+                C.bold +
+                'Default' +
+                C.reset +
+                '  ' +
+                C.dim +
+                '(settings.json raíz)' +
+                C.reset +
+                '  tema: ' +
+                (rootTheme ? C.bold + rootTheme + C.reset : C.dim + '(no definido)' + C.reset)
+        );
+
+        const profiles = listProfiles(r);
+        if (profiles.length === 0) {
+            warn('sin perfiles adicionales');
+            return;
+        }
+        profiles.forEach(function (p) {
+            const theme = readThemeOf(path.join(p.dir, 'settings.json'));
+            log(
+                '    ' +
+                    (p.orphan ? C.yellow : '') +
+                    p.name +
+                    C.reset +
+                    '  ' +
+                    C.dim +
+                    '(' +
+                    p.location +
+                    ')' +
+                    C.reset +
+                    '  tema: ' +
+                    (theme ? C.bold + theme + C.reset : C.dim + '(no definido)' + C.reset)
+            );
+        });
+    });
+}
+
+/** Carpetas User a considerar: --user-dir si se indicó, si no las autodetectadas. */
+function userRoots() {
+    if (OPTS.userDir) return isDir(OPTS.userDir) ? [OPTS.userDir] : [];
+    return defaultUserDirs().filter(isDir);
 }
 
 /** Lista todos los temas detectados con su diagnóstico de contraste. */
@@ -1104,7 +1537,7 @@ function listThemes(extDirs, activeLabel) {
     });
 }
 
-function main() {
+async function main() {
     if (OPTS.help) {
         printHelp();
         return;
@@ -1115,23 +1548,34 @@ function main() {
 
     const extDirs = resolveExtDirs();
 
+    if (OPTS.listProfiles) {
+        title('Perfiles de VS Code');
+        printProfiles(userRoots());
+        return;
+    }
+
     if (OPTS.listThemes) {
-        const userDir0 = resolveUserDir();
+        const userDir0 = await resolveUserDir();
         const s0 = readSettings(userDir0);
+        info('User dir:  ' + userDir0);
+        info('Perfil:    ' + describeUserDir(userDir0));
         title('Temas detectados');
         listThemes(extDirs, OPTS.themeName || s0.data['workbench.colorTheme']);
         return;
     }
 
-    const userDir = resolveUserDir();
+    const userDir = await resolveUserDir();
     info('User dir:  ' + userDir);
+    info('Perfil:    ' + describeUserDir(userDir));
     info('Ext dirs:  ' + extDirs.join(', '));
 
     const settings = readSettings(userDir);
     const themeLabel = OPTS.themeName || settings.data['workbench.colorTheme'];
 
     if (!themeLabel) {
-        fail('No hay "workbench.colorTheme" en settings.json. Usa --theme-name <label>.');
+        fail('El perfil ' + describeUserDir(userDir) + ' no define "workbench.colorTheme".');
+        fail('Archivo revisado: ' + settings.file);
+        fail('Opciones: --list-profiles (ver perfiles) o --theme-name "<label>" / --profile "<nombre>".');
         process.exit(4);
     }
 
@@ -1210,4 +1654,7 @@ function main() {
     }
 }
 
-main();
+main().catch(function (e) {
+    fail('Error inesperado: ' + (e && e.message ? e.message : e));
+    process.exit(1);
+});
