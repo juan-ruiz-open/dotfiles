@@ -30,9 +30,9 @@ alias os653="code ~/Coding/dev-front/openintl-sencha653"
 alias oapis="code ~/Coding/dev-front/openintl-apis"
 
 alias orapps-r="code ~/Coding/dev-front/openintl-reactapps -r"
-alias os602-r="code ~/Coding/dev-front/openintl-sencha602-r"
-alias os653-r="code ~/Coding/dev-front/openintl-sencha653-r"
-alias oapis-r="code ~/Coding/dev-front/openintl-apis-r"
+alias os602-r="code ~/Coding/dev-front/openintl-sencha602 -r"
+alias os653-r="code ~/Coding/dev-front/openintl-sencha653 -r"
+alias oapis-r="code ~/Coding/dev-front/openintl-apis -r"
 
 alias blitz="sh ~/Coding/dev-front/blitz/blitz.sh"
 
