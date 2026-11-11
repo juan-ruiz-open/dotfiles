@@ -18,9 +18,21 @@ alias home="cd ~"
 alias coding="cd ~/Coding/"
 alias front="cd ~/Coding/dev-front"
 alias back="cd ~/Coding/dev-back"
+
 alias rapps="cd ~/Coding/dev-front/openintl-reactapps"
 alias s602="cd ~/Coding/dev-front/openintl-sencha602"
 alias s653="cd ~/Coding/dev-front/openintl-sencha653"
+alias apis="cd ~/Coding/dev-front/openintl-apis"
+
+alias orapps="code ~/Coding/dev-front/openintl-reactapps"
+alias os602="code ~/Coding/dev-front/openintl-sencha602"
+alias os653="code ~/Coding/dev-front/openintl-sencha653"
+alias oapis="code ~/Coding/dev-front/openintl-apis"
+
+alias orapps-r="code ~/Coding/dev-front/openintl-reactapps -r"
+alias os602-r="code ~/Coding/dev-front/openintl-sencha602-r"
+alias os653-r="code ~/Coding/dev-front/openintl-sencha653-r"
+alias oapis-r="code ~/Coding/dev-front/openintl-apis-r"
 
 alias blitz="sh ~/Coding/dev-front/blitz/blitz.sh"
 
